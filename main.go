@@ -1,15 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
 type FileInfo struct {
@@ -25,6 +28,18 @@ type FileInfo struct {
 type FilesystemServer struct {
 	allowedDirs []string
 	server      *server.MCPServer
+}
+
+// Add these new types to the type declarations section
+type EditOperation struct {
+	OldText string `json:"oldText"`
+	NewText string `json:"newText"`
+}
+
+type EditFileArgs struct {
+	Path   string          `json:"path"`
+	Edits  []EditOperation `json:"edits"`
+	DryRun bool            `json:"dryRun"`
 }
 
 func NewFilesystemServer(allowedDirs []string) (*FilesystemServer, error) {
@@ -180,6 +195,45 @@ func NewFilesystemServer(allowedDirs []string) (*FilesystemServer, error) {
 		},
 	}, s.handleListAllowedDirectories)
 
+	// Add this to the NewFilesystemServer function after the other tool registrations
+	s.server.AddTool(mcp.Tool{
+		Name: "edit_file",
+		Description: "Make line-based edits to a text file. Each edit replaces exact line sequences " +
+			"with new content. Returns a git-style diff showing the changes made. " +
+			"Only works within allowed directories.",
+		InputSchema: mcp.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "Path of the file to edit",
+				},
+				"edits": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"oldText": map[string]interface{}{
+								"type":        "string",
+								"description": "Text to search for - must match exactly",
+							},
+							"newText": map[string]interface{}{
+								"type":        "string",
+								"description": "Text to replace with",
+							},
+						},
+						"required": []string{"oldText", "newText"},
+					},
+				},
+				"dryRun": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Preview changes using git-style diff format",
+					"default":     false,
+				},
+			},
+		},
+	}, s.handleEditFile)
+
 	return s, nil
 }
 
@@ -287,7 +341,168 @@ func (s *FilesystemServer) searchFiles(
 	return results, nil
 }
 
+// Add these utility functions
+func normalizeLineEndings(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
+}
+
+func createUnifiedDiff(originalContent, newContent, filepath string) string {
+	dmp := diffmatchpatch.New()
+	diffs := dmp.DiffMain(originalContent, newContent, true)
+	patch := dmp.PatchMake(diffs)
+	patchText := dmp.PatchToText(patch)
+
+	var result strings.Builder
+	result.WriteString("diff --git a/" + filepath + " b/" + filepath + "\n")
+	result.WriteString("--- a/" + filepath + "\n")
+	result.WriteString("+++ b/" + filepath + "\n")
+	result.WriteString(patchText)
+
+	return result.String()
+}
+
+func applyFileEdits(filePath string, edits []EditOperation, dryRun bool) (string, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+
+	modifiedContent := normalizeLineEndings(string(content))
+
+	// Apply edits sequentially
+	for _, edit := range edits {
+		normalizedOld := normalizeLineEndings(edit.OldText)
+		normalizedNew := normalizeLineEndings(edit.NewText)
+
+		// Try exact match first
+		if strings.Contains(modifiedContent, normalizedOld) {
+			modifiedContent = strings.Replace(modifiedContent, normalizedOld, normalizedNew, 1)
+			continue
+		}
+
+		// Try line-by-line matching with whitespace flexibility
+		oldLines := strings.Split(normalizedOld, "\n")
+		contentLines := strings.Split(modifiedContent, "\n")
+		matchFound := false
+
+		for i := 0; i <= len(contentLines)-len(oldLines); i++ {
+			potentialMatch := contentLines[i : i+len(oldLines)]
+			isMatch := true
+
+			for j, oldLine := range oldLines {
+				if strings.TrimSpace(oldLine) != strings.TrimSpace(potentialMatch[j]) {
+					isMatch = false
+					break
+				}
+			}
+
+			if isMatch {
+				// Preserve original indentation of first line
+				originalIndent := ""
+				if indentMatch := regexp.MustCompile(`^\s*`).FindString(contentLines[i]); indentMatch != "" {
+					originalIndent = indentMatch
+				}
+
+				// Split new content and handle indentation
+				newLines := strings.Split(normalizedNew, "\n")
+				for j, line := range newLines {
+					if j == 0 {
+						newLines[j] = originalIndent + strings.TrimLeft(line, " \t")
+					} else {
+						// For subsequent lines, try to preserve relative indentation
+						oldIndent := regexp.MustCompile(`^\s*`).FindString(oldLines[j])
+						newIndent := regexp.MustCompile(`^\s*`).FindString(line)
+						relativeIndent := len(newIndent) - len(oldIndent)
+						if relativeIndent > 0 {
+							newLines[j] = originalIndent + strings.Repeat(" ", relativeIndent) + strings.TrimLeft(line, " \t")
+						} else {
+							newLines[j] = originalIndent + strings.TrimLeft(line, " \t")
+						}
+					}
+				}
+
+				// Replace the matching lines with the new content
+				newContent := strings.Join(newLines, "\n")
+				beforeLines := contentLines[:i]
+				afterLines := contentLines[i+len(oldLines):]
+				contentLines = append(beforeLines, append([]string{newContent}, afterLines...)...)
+				modifiedContent = strings.Join(contentLines, "\n")
+				matchFound = true
+				break
+			}
+		}
+
+		if !matchFound {
+			return "", fmt.Errorf("could not find exact match for edit:\n%s", edit.OldText)
+		}
+	}
+
+	// Create unified diff
+	diff := createUnifiedDiff(string(content), modifiedContent, filePath)
+
+	// Format diff output
+	var numBackticks int = 3
+	for strings.Contains(diff, strings.Repeat("`", numBackticks)) {
+		numBackticks++
+	}
+	formattedDiff := fmt.Sprintf("%s\n%s%s\n\n",
+		strings.Repeat("`", numBackticks),
+		diff,
+		strings.Repeat("`", numBackticks))
+
+	if !dryRun {
+		err = os.WriteFile(filePath, []byte(modifiedContent), 0644)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return formattedDiff, nil
+}
+
 // Tool handlers
+
+func (s *FilesystemServer) handleEditFile(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	// Parse and validate arguments
+	jsonData, err := json.Marshal(arguments)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal arguments: %w", err)
+	}
+
+	var args EditFileArgs
+	if err := json.Unmarshal(jsonData, &args); err != nil {
+		return nil, fmt.Errorf("failed to parse arguments: %w", err)
+	}
+
+	// Validate path
+	validPath, err := s.validatePath(args.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply edits
+	diff, err := applyFileEdits(validPath, args.Edits, args.DryRun)
+	if err != nil {
+		return &mcp.CallToolResult{
+			Content: []interface{}{
+				mcp.TextContent{
+					Type: "text",
+					Text: fmt.Sprintf("Error editing file: %v", err),
+				},
+			},
+			IsError: true,
+		}, nil
+	}
+
+	return &mcp.CallToolResult{
+		Content: []interface{}{
+			mcp.TextContent{
+				Type: "text",
+				Text: diff,
+			},
+		},
+	}, nil
+}
 
 func (s *FilesystemServer) handleReadFile(
 	arguments map[string]interface{},
